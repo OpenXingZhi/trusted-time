@@ -54,6 +54,7 @@ class TrustedClock(
     }
 
     private suspend fun refreshInternal(): TrustedTime {
+        val before = deviceTime.monotonic()
         val successful = coroutineScope {
             sources.map { source -> async { runCatching { source.now() } } }
                 .awaitAll()
@@ -67,11 +68,14 @@ class TrustedClock(
 
         val consensus = largestConsensus(successful)
         if (consensus.size < minimumSourceAgreement) throw TrustedTimeException.SourcesDisagree
+        val after = deviceTime.monotonic()
+        if (after < before) throw TrustedTimeException.RefreshRequired
         val trustedInstant = consensus.sorted()[consensus.size / 2]
+            .plus((after - before).dividedBy(2))
         val anchor = TimeAnchor(
             trustedInstant = trustedInstant,
             bootId = deviceTime.bootId(),
-            monotonicMark = deviceTime.monotonic(),
+            monotonicMark = after,
         )
         store.save(anchor)
         return TrustedTime(trustedInstant)
