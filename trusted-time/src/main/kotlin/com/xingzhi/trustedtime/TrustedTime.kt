@@ -11,6 +11,23 @@ fun interface TimeSource {
     suspend fun now(): Instant
 }
 
+/** Small application seam implemented by [TrustedClock] and test adapters. */
+interface TrustedTimeProvider {
+    suspend fun now(): Result<TrustedTime>
+    suspend fun refresh(): Result<TrustedTime>
+}
+
+sealed interface TrustedTimeStatus {
+    data object Idle : TrustedTimeStatus
+    data object Synchronizing : TrustedTimeStatus
+    data class Available(
+        val time: TrustedTime,
+        val fromCache: Boolean,
+        val agreeingSources: Int,
+    ) : TrustedTimeStatus
+    data class Unavailable(val error: Throwable) : TrustedTimeStatus
+}
+
 /** Persists an anchor so refresh policy survives process restarts. */
 interface TimeAnchorStore {
     suspend fun load(): TimeAnchor?

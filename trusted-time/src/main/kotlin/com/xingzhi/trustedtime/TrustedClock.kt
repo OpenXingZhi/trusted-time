@@ -3,9 +3,12 @@ package com.xingzhi.trustedtime
 import java.time.Duration
 import java.time.Instant
 import kotlin.math.absoluteValue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -22,8 +25,10 @@ class TrustedClock(
     private val maxAnchorAge: Duration = Duration.ofDays(1),
     private val maxSourceSkew: Duration = Duration.ofSeconds(10),
     private val minimumSourceAgreement: Int = 2,
-) {
+) : TrustedTimeProvider {
     private val mutex = Mutex()
+    private val _status = MutableStateFlow<TrustedTimeStatus>(TrustedTimeStatus.Idle)
+    val status = _status.asStateFlow()
 
     init {
         require(sources.isNotEmpty()) { "At least one trusted time source is required." }
@@ -35,15 +40,17 @@ class TrustedClock(
     }
 
     /** Returns a valid cached reading or refreshes it from authenticated sources. */
-    suspend fun now(): Result<TrustedTime> = mutex.withLock {
-        runCatching {
-            cachedNow(store.load()) ?: refreshInternal()
+    override suspend fun now(): Result<TrustedTime> = mutex.withLock {
+        resultOf {
+            cachedNow(store.load())?.also { time ->
+                _status.value = TrustedTimeStatus.Available(time, fromCache = true, agreeingSources = 0)
+            } ?: refreshInternal()
         }
     }
 
     /** Forces remote synchronization and atomically replaces the persisted anchor. */
-    suspend fun refresh(): Result<TrustedTime> = mutex.withLock {
-        runCatching { refreshInternal() }
+    override suspend fun refresh(): Result<TrustedTime> = mutex.withLock {
+        resultOf { refreshInternal() }
     }
 
     private fun cachedNow(anchor: TimeAnchor?): TrustedTime? {
@@ -54,11 +61,19 @@ class TrustedClock(
     }
 
     private suspend fun refreshInternal(): TrustedTime {
+        _status.value = TrustedTimeStatus.Synchronizing
         val before = deviceTime.monotonic()
         val successful = coroutineScope {
-            sources.map { source -> async { runCatching { source.now() } } }
-                .awaitAll()
-                .mapNotNull(Result<Instant>::getOrNull)
+            sources.map { source ->
+                async {
+                    try {
+                        source.now()
+                    } catch (error: Throwable) {
+                        error.rethrowCancellation()
+                        null
+                    }
+                }
+            }.awaitAll().filterNotNull()
         }
         if (successful.size < minimumSourceAgreement) {
             throw TrustedTimeException.SourceFailed(
@@ -78,7 +93,13 @@ class TrustedClock(
             monotonicMark = after,
         )
         store.save(anchor)
-        return TrustedTime(trustedInstant)
+        return TrustedTime(trustedInstant).also { time ->
+            _status.value = TrustedTimeStatus.Available(
+                time = time,
+                fromCache = false,
+                agreeingSources = consensus.size,
+            )
+        }
     }
 
     private fun largestConsensus(readings: List<Instant>): List<Instant> = readings
@@ -89,4 +110,16 @@ class TrustedClock(
         }
         .maxByOrNull(List<Instant>::size)
         .orEmpty()
+
+    private suspend inline fun <T> resultOf(crossinline block: suspend () -> T): Result<T> = try {
+        Result.success(block())
+    } catch (error: Throwable) {
+        error.rethrowCancellation()
+        _status.value = TrustedTimeStatus.Unavailable(error)
+        Result.failure(error)
+    }
+
+    private fun Throwable.rethrowCancellation() {
+        if (this is CancellationException) throw this
+    }
 }

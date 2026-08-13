@@ -2,9 +2,11 @@ package com.xingzhi.trustedtime
 
 import java.time.Duration
 import java.time.Instant
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.Test
 
 class TrustedClockTest {
@@ -49,6 +51,36 @@ class TrustedClockTest {
         ).now()
 
         assertTrue(result.exceptionOrNull() is TrustedTimeException.SourcesDisagree)
+    }
+
+    @Test
+    fun `propagates cancellation from a time source`() = runTest {
+        val clock = TrustedClock(
+            sources = listOf(
+                TimeSource { throw CancellationException("cancel") },
+                TimeSource { base },
+            ),
+            store = MemoryStore(),
+            deviceTime = FakeDeviceTime(),
+        )
+
+        assertThrows<CancellationException> { clock.refresh() }
+    }
+
+    @Test
+    fun `reports whether available time came from network or cache`() = runTest {
+        val device = FakeDeviceTime()
+        val store = MemoryStore()
+        val clock = clock(device, store, listOf(base, base, base.plusSeconds(30)))
+
+        clock.now().getOrThrow()
+        val network = clock.status.value as TrustedTimeStatus.Available
+        assertTrue(!network.fromCache)
+        assertEquals(2, network.agreeingSources)
+
+        clock.now().getOrThrow()
+        val cached = clock.status.value as TrustedTimeStatus.Available
+        assertTrue(cached.fromCache)
     }
 
     @Test
